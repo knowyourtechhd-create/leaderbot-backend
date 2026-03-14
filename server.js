@@ -8,48 +8,50 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-const BINANCE_BASE = "https://www.binance.com/bapi/futures/v3/public/future/leaderboard";
-
 const HEADERS = {
+  "Accept": "*/*",
+  "Accept-Language": "en-US,en;q=0.9",
   "Content-Type": "application/json",
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-  "Accept": "application/json",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Origin": "https://www.binance.com",
+  "Referer": "https://www.binance.com/en/futures-activity/leaderboard",
+  "bnc-uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "clienttype": "web",
+  "lang": "en",
 };
 
-// ── Health check ──────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "LeaderBot backend running", time: new Date().toISOString() });
 });
 
-// ── Get top N traders from leaderboard ────────────────────────────────────
+// ── Leaderboard ────────────────────────────────────────────────────────────
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 20, 20);
-    const tradeType = req.query.tradeType || "PERPETUAL";
 
-    const body = {
-      isShared: true,
-      isTrader: false,
-      periodType: "DAILY",
-      statisticsType: "ROI",
-      tradeType,
-    };
+    const response = await fetch(
+      "https://www.binance.com/bapi/futures/v3/public/future/leaderboard/getLeaderboard",
+      {
+        method: "POST",
+        headers: HEADERS,
+        body: JSON.stringify({
+          isShared: true,
+          isTrader: false,
+          periodType: "DAILY",
+          statisticsType: "ROI",
+          tradeType: "PERPETUAL",
+        }),
+      }
+    );
 
-    const response = await fetch(`${BINANCE_BASE}/getLeaderboard`, {
-      method: "POST",
-      headers: HEADERS,
-      body: JSON.stringify(body),
-    });
+    const text = await response.text();
 
-    if (!response.ok) {
-      throw new Error(`Binance returned ${response.status}`);
-    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch { throw new Error(`Binance returned non-JSON: ${text.slice(0, 200)}`); }
 
-    const data = await response.json();
-
-    if (!data.data) {
-      throw new Error("No data from Binance leaderboard");
+    if (!response.ok || !data.data) {
+      throw new Error(`Binance error ${response.status}: ${data.message || text.slice(0, 100)}`);
     }
 
     const traders = data.data.slice(0, limit).map((t, i) => ({
@@ -57,7 +59,7 @@ app.get("/api/leaderboard", async (req, res) => {
       encryptedUid: t.encryptedUid,
       nickName: t.nickName || `Trader_${i + 1}`,
       roi: t.roi ? (t.roi * 100).toFixed(2) : "0.00",
-      pnl: t.pnl ? t.pnl.toFixed(2) : "0.00",
+      pnl: t.pnl ? parseFloat(t.pnl).toFixed(2) : "0.00",
       winRate: t.winRate ? (t.winRate * 100).toFixed(1) : "0.0",
       followerCount: t.followerCount || 0,
       updateTime: t.updateTimeStamp || Date.now(),
@@ -65,26 +67,25 @@ app.get("/api/leaderboard", async (req, res) => {
 
     res.json({ success: true, traders, fetchedAt: Date.now() });
   } catch (err) {
-    console.error("Leaderboard fetch error:", err.message);
+    console.error("Leaderboard error:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Get positions for a specific trader ───────────────────────────────────
+// ── Single trader positions ────────────────────────────────────────────────
 app.get("/api/positions/:uid", async (req, res) => {
   try {
-    const { uid } = req.params;
-    const tradeType = req.query.tradeType || "PERPETUAL";
-
-    const response = await fetch(`${BINANCE_BASE}/getOtherPosition`, {
-      method: "POST",
-      headers: HEADERS,
-      body: JSON.stringify({ encryptedUid: uid, tradeType }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Binance returned ${response.status}`);
-    }
+    const response = await fetch(
+      "https://www.binance.com/bapi/futures/v3/public/future/leaderboard/getOtherPosition",
+      {
+        method: "POST",
+        headers: HEADERS,
+        body: JSON.stringify({
+          encryptedUid: req.params.uid,
+          tradeType: "PERPETUAL",
+        }),
+      }
+    );
 
     const data = await response.json();
     const positions = (data.data?.otherPositionRetList || []).map((p) => ({
@@ -94,38 +95,39 @@ app.get("/api/positions/:uid", async (req, res) => {
       pnl: p.unrealizedProfit,
       roe: p.roe ? (p.roe * 100).toFixed(2) : "0.00",
       amount: p.amount,
-      updateTime: p.updateTimeStamp || Date.now(),
-      yellow: p.yellow || false,
-      tradeBefore: p.tradeBefore || false,
       leverage: p.leverage || 1,
       direction: p.amount > 0 ? "LONG" : "SHORT",
+      updateTime: p.updateTimeStamp || Date.now(),
     }));
 
-    res.json({ success: true, uid, positions, fetchedAt: Date.now() });
+    res.json({ success: true, uid: req.params.uid, positions, fetchedAt: Date.now() });
   } catch (err) {
-    console.error("Positions fetch error:", err.message);
     res.status(500).json({ success: false, error: err.message, positions: [] });
   }
 });
 
-// ── Get positions for multiple traders at once ────────────────────────────
+// ── Batch positions ────────────────────────────────────────────────────────
 app.post("/api/positions/batch", async (req, res) => {
   try {
-    const { uids, tradeType = "PERPETUAL" } = req.body;
-
+    const { uids } = req.body;
     if (!uids || !Array.isArray(uids)) {
       return res.status(400).json({ success: false, error: "uids array required" });
     }
 
-    const results = await Promise.allSettled(
-      uids.map(async (uid) => {
-        const response = await fetch(`${BINANCE_BASE}/getOtherPosition`, {
-          method: "POST",
-          headers: HEADERS,
-          body: JSON.stringify({ encryptedUid: uid, tradeType }),
-        });
+    // Stagger requests slightly to avoid rate limiting
+    const results = {};
+    for (const uid of uids) {
+      try {
+        const response = await fetch(
+          "https://www.binance.com/bapi/futures/v3/public/future/leaderboard/getOtherPosition",
+          {
+            method: "POST",
+            headers: HEADERS,
+            body: JSON.stringify({ encryptedUid: uid, tradeType: "PERPETUAL" }),
+          }
+        );
         const data = await response.json();
-        const positions = (data.data?.otherPositionRetList || []).map((p) => ({
+        results[uid] = (data.data?.otherPositionRetList || []).map((p) => ({
           symbol: p.symbol,
           entryPrice: p.entryPrice,
           markPrice: p.markPrice,
@@ -134,28 +136,20 @@ app.post("/api/positions/batch", async (req, res) => {
           amount: p.amount,
           leverage: p.leverage || 1,
           direction: p.amount > 0 ? "LONG" : "SHORT",
-          updateTime: p.updateTimeStamp || Date.now(),
         }));
-        return { uid, positions };
-      })
-    );
-
-    const traderPositions = {};
-    results.forEach((r, i) => {
-      if (r.status === "fulfilled") {
-        traderPositions[uids[i]] = r.value.positions;
-      } else {
-        traderPositions[uids[i]] = [];
+      } catch {
+        results[uid] = [];
       }
-    });
+      // Small delay between requests
+      await new Promise(r => setTimeout(r, 150));
+    }
 
-    res.json({ success: true, traderPositions, fetchedAt: Date.now() });
+    res.json({ success: true, traderPositions: results, fetchedAt: Date.now() });
   } catch (err) {
-    console.error("Batch positions error:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`LeaderBot backend running on port ${PORT}`);
+  console.log(`LeaderBot backend on port ${PORT}`);
 });
